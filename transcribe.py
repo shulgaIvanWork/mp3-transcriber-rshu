@@ -219,6 +219,8 @@ def transcribe_chunked(
                     "text": last_seg_text[:200],
                 })
 
+        return all_seg_count
+
     finally:
         import shutil
         shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -247,33 +249,49 @@ def transcribe_file(
     text_parts: list[str] = []
     total_dur = 0.0
 
+    do_chunk = False
     try:
-        do_chunk = False
+        total_dur = get_audio_duration(filepath)
+        if total_dur > LONG_FILE_THRESHOLD:
+            do_chunk = True
+            print(f"  ⏱️   {total_dur:.0f} с ({total_dur/3600:.1f} ч) — чанковый режим")
+    except Exception:
+        pass  # ffprobe не сработал — транскрибируем как есть
+
+    def transcribe_pass(with_vad: bool) -> int:
+        """Один проход транскрибации; при ошибке пишет error в прогресс и выходит."""
         try:
-            total_dur = get_audio_duration(filepath)
-            if total_dur > LONG_FILE_THRESHOLD:
-                do_chunk = True
-                print(f"  ⏱️   {total_dur:.0f} с ({total_dur/3600:.1f} ч) — чанковый режим")
-        except Exception:
-            pass  # ffprobe не сработал — транскрибируем как есть
+            if do_chunk:
+                return transcribe_chunked(model, filepath, language, with_vad,
+                                          progress_file, t0, text_parts)
+            return transcribe_stream(model, filepath, language, with_vad,
+                                     progress_file, t0, text_parts)
+        except IndexError as e:
+            print(f"\n  ❌  В файле нет аудиодорожки: {e}")
+            if progress_file:
+                _write_progress(progress_file, {"status": "error",
+                                "error": f"Нет аудиодорожки: {e}"})
+            sys.exit(1)
+        except Exception as e:
+            print(f"\n  ❌  Ошибка: {e}")
+            if progress_file:
+                _write_progress(progress_file, {"status": "error", "error": str(e)})
+            sys.exit(1)
 
-        if do_chunk:
-            transcribe_chunked(model, filepath, language, vad,
-                               progress_file, t0, text_parts)
-        else:
-            transcribe_stream(model, filepath, language, vad,
-                              progress_file, t0, text_parts)
+    seg_count = transcribe_pass(vad)
 
-    except IndexError as e:
-        print(f"\n  ❌  В файле нет аудиодорожки: {e}")
+    # VAD иногда отфильтровывает всю речь (тихие/шумные записи) — повторяем без него
+    if seg_count == 0 and vad:
+        print("\n  ⚠️  Пустой результат с VAD-фильтром — повторяю без VAD")
+        seg_count = transcribe_pass(False)
+
+    if seg_count == 0:
+        print("\n  ❌  Речь не распознана (файл пустой, битый или без голоса)")
         if progress_file:
-            _write_progress(progress_file, {"status": "error",
-                            "error": f"Нет аудиодорожки: {e}"})
-        sys.exit(1)
-    except Exception as e:
-        print(f"\n  ❌  Ошибка: {e}")
-        if progress_file:
-            _write_progress(progress_file, {"status": "error", "error": str(e)})
+            _write_progress(progress_file, {
+                "status": "error",
+                "error": "Речь не распознана: файл пустой, битый или без голосовой дорожки",
+            })
         sys.exit(1)
 
     elapsed = time.time() - t0
@@ -288,7 +306,7 @@ def transcribe_file(
             "total_duration_sec": round(total_dur, 1),
             "processed_sec": round(total_dur, 1),
             "elapsed_sec": round(elapsed, 1),
-            "segments_count": 0, "text": "",
+            "segments_count": seg_count, "text": "",
         })
 
     speed = total_dur / elapsed if elapsed > 0 else 0

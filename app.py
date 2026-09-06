@@ -130,6 +130,12 @@ async def process_job(job: dict):
         logf.close()
 
     if returncode == 0 and txt_path.exists():
+        # Страховка: пустой файл результата — не успех (например, файл без речи)
+        if txt_path.stat().st_size == 0:
+            db.mark_error(job_id, "Пустой результат: речь не распознана (файл пустой/битый?)")
+            print(f"⚠️  Пустой текст {job_id}")
+            _cleanup(txt_path, progress_file, log_path)
+            return
         duration = None
         try:
             pdata = json.loads(progress_file.read_text(encoding="utf-8"))
